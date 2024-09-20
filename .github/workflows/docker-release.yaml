@@ -1,0 +1,137 @@
+name: Release App
+
+on:
+  push:
+    tags:
+      - release-2.0.0-beta.*
+
+env:
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+  DOCKERHUB_IMAGE: ${{ github.repository }}
+  PROJECT_NAME: Product Development
+  PROJECT_ENV: Development
+
+jobs:
+  check-version:
+    name: Check Version
+    runs-on: self-hosted
+    outputs:
+      prerelease: ${{ steps.version.outputs.prerelease && true || false }}
+    steps:
+      - name: Check version
+        uses: madhead/semver-utils@v4
+        id: version
+        with:
+          version: 5.0.0-beta
+          lenient: false
+
+  checkout-and-create-release:
+    name: Checkout and Create Release
+    runs-on: self-hosted
+    needs: check-version
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v2
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create \
+            "$GITHUB_REF_NAME" \
+            ${{ needs.check-version.outputs.prerelease == 'true' && '--prerelease' || '' }} \
+             --generate-notes
+
+  build-and-push-to-docker:
+    name: Push MVDP Docker image to Docker Hub
+    runs-on: self-hosted
+    needs: checkout-and-create-release
+    permissions:
+      contents: write
+    steps:
+      - name: Generate .env file
+        run: |
+          cat .env.example | sed 's/^#//' > .env
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: mvdevops/mvdp:core-5.0.0-beta
+
+  deploy-to-remote-server:
+    name: pull and up MVDP in Remote Server
+    runs-on: self-hosted
+    needs: build-and-push-to-docker
+    steps:
+      - name: Connect to Remote Server and Run Commands
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PRODUCT_DEV_HOST }}
+          username: ${{ secrets.SERVER_DEFAULT_USER }}
+          password: ${{ secrets.SERVER_DEFAULT_PASSWORD }}
+          port: ${{ secrets.SERVER_DEFAULT_PORT }}
+          sync: true
+          script_stop: true
+          script: |
+            cd mv-setup
+            ./docker-compose.sh pull mvdp-release && ./docker-compose.sh up -d mvdp-release
+
+  # trigger_automate_testing:
+  #   name: Trigger Automate Testing
+  #   runs-on: ubuntu-latest
+  #   needs: deploy_to_remote_server
+  #   steps:
+  #     - uses: actions/github-script@v6
+  #       with:
+  #         github-token: ${{ secrets.PAT_TOKEN }}
+  #         script: |
+  #           const result = await github.rest.repos.createDispatchEvent({
+  #             owner: 'machine-vision-indonesia',
+  #             repo: 'mv-automate-test',
+  #             event_type: 'automate_test',
+  #             client_payload: {"branch": "main"}
+  #           })
+  #           console.log(result);
+
+  notify:
+    runs-on: self-hosted
+    needs: [ check-version, checkout-and-create-release, build-and-push-to-docker, deploy-to-remote-server ]
+    if: always()
+    steps:
+      - name: Determine final job status
+        id: determine_status
+        run: |
+          if [[ "${{ needs.check-version.result }}" == "failure" || "${{ needs.checkout-and-create-release.result }}" == "failure" || "${{ needs.build-and-push-to-docker.result }}" == "failure" ]]; then
+            echo "final_status=failure" >> $GITHUB_OUTPUT
+          else
+            echo "final_status=success" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send status message to Microsoft Teams
+        uses: neonidian/teams-notify-build-status@v4.1.0
+        with:
+          webhookUrl: ${{ secrets.MSTEAMS_WEBHOOK }}
+          status: ${{ steps.determine_status.outputs.final_status }}
+          title: >-
+            Deployment information of ${{ env.PROJECT_NAME }} - ${{ env.PROJECT_ENV }}
+          titleBackgroundColor: ${{ steps.determine_status.outputs.final_status }}
+          message: >-
+            The deployment of the ${{ env.PROJECT_NAME }} - ${{ env.PROJECT_ENV }} triggered by ${{ github.actor }} has resulted in a ${{ steps.determine_status.outputs.final_status }} status.
+        env:
+          SHOULD_DISPLAY_ACTOR_LABEL: true
+          SHOULD_DISPLAY_VIEW_RUN_BUTTON: true
+          SHOULD_DISPLAY_VIEW_COMMIT_BUTTON: true

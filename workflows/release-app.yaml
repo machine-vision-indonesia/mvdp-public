@@ -1,0 +1,70 @@
+name: Release App
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build_and_push_to_docker:
+    name: Push MVDP Docker image to Docker Hub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v2
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Generate .env file
+        run: |
+          cat .env.example | sed 's/^#//' > .env
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: mvdevops/mvdp:core-4.0.0
+
+  deploy_to_remote_server:
+    name: pull and up MVDP in Remote Server
+    runs-on: ubuntu-latest
+    needs: build_and_push_to_docker
+    steps:
+      - name: Connect to Remote Server and Run Commands
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.PRODUCT_DEV_HOST }}
+          username: ${{ secrets.SERVER_DEFAULT_USER }}
+          password: ${{ secrets.SERVER_DEFAULT_PASSWORD }}
+          port: ${{ secrets.SERVER_DEFAULT_PORT }}
+          sync: true
+          script_stop: true
+          script: |
+            cd mv-setup
+            ./docker-compose.sh pull mvdp && ./docker-compose.sh up -d mvdp
+
+  trigger_automate_testing:
+    name: Trigger Automate Testing
+    runs-on: ubuntu-latest
+    needs: deploy_to_remote_server
+    steps:
+      - uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const result = await github.rest.repos.createDispatchEvent({
+              owner: 'machine-vision-indonesia',
+              repo: 'mv-automate-test',
+              event_type: 'automate_test',
+              client_payload: {"branch": "main"}
+            })
+            console.log(result);
